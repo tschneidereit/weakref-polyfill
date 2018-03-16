@@ -1,60 +1,93 @@
-var WeakRefGroup;
+var WeakFactory;
 var pretendNewTurn;
 
 {
-  WeakRefGroup = class WeakRefGroup {
+  WeakFactory = class WeakFactory {
     constructor(cleanup = undefined) {
-      groupsData.set(this, { cleanup, refs: new Set() });
+      factoriesData.set(this, { cleanup, cells: new Set() });
+    }
+
+    makeCell(target, holdings = undefined) {
+      return makeCellOrRef(this, target, holdings, WeakCell);
     }
 
     makeRef(target, holdings = undefined) {
-      const groupData = groupsData.get(this);
-      if (!groupData)
-        throw new TypeError("Can't make a WeakRef for a group that's been shut down");
-
-      const refs = groupData.refs;
-      const ref = new WeakRef(target);
-      refs.add(ref);
-      holdingsMap.set(ref, holdings);
-      return ref;
+      return makeCellOrRef(this, target, holdings, WeakRef);
     }
 
-    purgeSome(cleanupNow) {
-      const groupData = groupsData.get(this);
-      if (!groupData)
-        throw new TypeError("Can't purge references for a group that's been shut down");
+    cleanupSome(cleanupNow) {
+      const factoryData = factoriesData.get(this);
+      if (!factoryData)
+        throw new TypeError("Factory has been shut down");
 
-      purgeGroup(cleanupNow, groupData.refs);
+      cleanupFactory(cleanupNow, factoryData.cells);
     }
 
     shutdown() {
-      const groupData = groupsData.get(this);
-      if (!groupData)
-        throw new TypeError("Group has already been shut down");
+      const factoryData = factoriesData.get(this);
+      if (!factoryData)
+        throw new TypeError("Factory has been shut down");
 
-      // TODO: should shutting down a group remove the reference to the cleanup function?
-      groupsData.delete(this);
+      // TODO: should shutting down a factory remove the reference to the cleanup function?
+      factoriesData.delete(this);
     }
   }
 
-  const groupsData = new WeakMap();
+  function makeCellOrRef(factory, target, holdings, ctor) {
+    const factoryData = factoriesData.get(factory);
+    if (!factoryData)
+      throw new TypeError("Factory has been shut down");
+
+    const cells = factoryData.cells;
+    const cell = new ctor(target, weakCellCtorGuard);
+    cells.add(cell);
+    holdingsMap.set(cell, holdings);
+    return cell;
+  }
+
+  const factoriesData = new WeakMap();
   const holdingsMap = new WeakMap();
+  const cellsMap = new WeakMap();
+  const refsBrandingCheck = new WeakSet();
   const strongRefs = new Set();
 
-  const WeakRef = class {
-    constructor(target) {
-      this.weakmap = new WeakMap();
-      this.weakmap.set(target, null);
+  const weakCellCtorGuard = {};
+
+  const WeakCell = class {
+    constructor(target, guard = undefined) {
+      if (guard !== weakCellCtorGuard)
+        throw new TypeError("WeakCells and WeakRefs can only be created using WeakFactory");
+
+      // Need to use a WeakMap instead of a WeakSet because the SpiderMonkey
+      // shell doesn't have a way to get a WeakSet's keys.
+      const weakmap = new WeakMap();
+      cellsMap.set(this, weakmap);
+      weakmap.set(target, null);
     }
 
     get holdings() {
       return holdingsMap.get(this);
     }
 
+    drop() {
+      // TODO: should this also drop the reference to holdings?
+      cellsMap.delete(this);
+    }
+  }
+
+  const WeakRef = class extends WeakCell {
+    constructor(target, guard = undefined) {
+      super(target, guard);
+      refsBrandingCheck.add(this);
+    }
     deref() {
-      if (!this.weakmap)
+      if (!refsBrandingCheck.has(this))
+        throw new TypeError("WeakRef.prototype.deref must only be called on WeakRef instances");
+
+      const weakmap = cellsMap.get(this);
+      if (!weakmap)
         return undefined;
-      const keys = nondeterministicGetWeakMapKeys(this.weakmap);
+      const keys = nondeterministicGetWeakMapKeys(weakmap);
       if (keys.length === 0)
         return undefined;
       let target = keys[0];
@@ -62,27 +95,25 @@ var pretendNewTurn;
         strongRefs.add(target);
       return target;
     }
-
-    drop() {
-      this.weakmap = undefined;
-    }
   }
+  
+    delete WeakCell.prototype.constructor;
+    delete WeakRef.prototype.constructor;
 
-  function* iterateClearedRefs(refs) {
-    for (let ref of refs) {
-      if (ref.weakmap && nondeterministicGetWeakMapKeys(ref.weakmap).length === 0) {
-        yield ref;
+  function* iterateClearedRefs(cells) {
+    for (let cell of cells) {
+      const weakmap = cellsMap.get(cell);
+      if (weakmap && nondeterministicGetWeakMapKeys(weakmap).length === 0) {
+        yield cell;
       }
     }
   }
 
-  delete WeakRef.prototype.constructor;
-
-  function purgeGroup(cleanup, refs) {
-    for (ref of iterateClearedRefs(refs)) {
-      cleanup(ref);
-      // TODO: unclear from the slides if the ref should be removed.
-      refs.delete(ref);
+  function cleanupFactory(cleanup, cells) {
+    for (let cell of iterateClearedRefs(cells)) {
+      cleanup(cell);
+      // TODO: unclear from the slides if the cell should be removed.
+      cells.delete(cell);
     }
   }
 
@@ -92,10 +123,10 @@ var pretendNewTurn;
     if (!runCleanup)
       return;
 
-    const groups = nondeterministicGetWeakMapKeys(groupsData);
-    for (let group of groups) {
-      let { cleanup, refs } = groupsData.get(group);
-      purgeGroup(cleanup, refs);
+    const factories = nondeterministicGetWeakMapKeys(factoriesData);
+    for (let factory of factories) {
+      let { cleanup, cells } = factoriesData.get(factory);
+      cleanupFactory(cleanup, cells);
     }
   }
 }
